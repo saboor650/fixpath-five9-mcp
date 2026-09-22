@@ -1,4 +1,7 @@
-name = "five9-mcp"
+# FixPath LLC — SPS Community Solutions (100 Boulevard) Worker.
+# One Worker per client domain; the Worker name below must match the
+# Cloudflare Worker this repo is connected to (Workers Builds).
+name = "fixpath-five9-mcp-sps"
 main = "src/index.js"
 compatibility_date = "2026-07-01"
 
@@ -27,5 +30,5 @@ FIVE9_API_HOST = "api.five9.com"        # EU: api.eu.five9.com  CA: api.ca.five9
 FIVE9_ADMIN_VERSION = "v13"             # Config Web Services WSDL version
 FIVE9_SUPERVISOR_VERSION = "v13"        # Statistics Web Services WSDL version
 # Labels shown to the AI in the about tool / MCP instructions (one Worker per client domain):
-DOMAIN_LABEL = ""                       # e.g. "Example Client Inc"
-CLIENT_LABEL = ""                       # e.g. "Example Client"
+DOMAIN_LABEL = "SPS Community Solutions"
+CLIENT_LABEL = "SPS Community Solutions (100 Boulevard)"
