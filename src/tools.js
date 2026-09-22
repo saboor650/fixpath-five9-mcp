@@ -1,0 +1,1507 @@
+// MCP tool definitions + dispatch. Each tool maps to one or two Five9 SOAP
+// calls and returns plain JSON for the model.
+
+import { Five9Client, toArray } from './five9.js';
+import { Five9RestClient } from './five9rest.js';
+import { buildAbout } from './about.js';
+import { validateFlow, collectFlowRefs, composeIvrXml, flowToMermaid, scriptXmlToMermaid, IVR_NODE_TYPES, IF_ELSE_OPS } from './ivr.js';
+import { listIvrModules, patchIvrXml } from './ivrpatch.js';
+import { synthesizeUlawWav } from './tts.js';
+import { findCalls, bulkCreateUsers } from './ops.js';
+
+// MCP clients that cached an older tool schema pass unknown array/object
+// parameters as JSON *strings*. Accept both shapes so a stale client still
+// works after a deploy adds parameters.
+function jsonish(v) {
+  if (typeof v !== 'string') return v;
+  const t = v.trim();
+  if (!(t.startsWith('[') || t.startsWith('{'))) return v;
+  try { return JSON.parse(t); } catch { return v; }
+}
+
+export const TOOLS = [
+  {
+    name: 'about',
+    description: 'Who operates this server, why it exists, and how to work with it. Call this when you need context about the operator or ground rules.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    five9: false,
+    handler: (_f9, _a, cfg) => buildAbout({ domainLabel: cfg?.domainLabel || 'the configured Five9 domain', clientLabel: cfg?.clientLabel || 'the client' }),
+  },
+  {
+    name: 'check_connection',
+    description: 'Verify that the Worker can authenticate to Five9. Returns the number of skills visible to the configured user. Run this first if other tools are failing.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    handler: async (f9) => {
+      const skills = await f9.getSkills('.*');
+      return { ok: true, host: f9.host, adminVersion: f9.adminVersion, skillsVisible: skills.length };
+    },
+  },
+  {
+    name: 'list_campaigns',
+    description: 'List Five9 campaigns (name, type, state, mode). Optional regex pattern filters by campaign name.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on campaign name (default ".*" = all)' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getCampaigns(a.pattern || '.*'),
+  },
+  {
+    name: 'control_campaign',
+    description: 'Control a Five9 campaign\'s runtime state by exact name: start, stop (graceful), force_stop (drops active calls), reset (re-enables dialed records), or reset_list_positions (restart lists from the top).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['start', 'stop', 'force_stop', 'reset', 'reset_list_positions'] },
+        campaign_name: { type: 'string', description: 'Exact campaign name' },
+      },
+      required: ['action', 'campaign_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.controlCampaign(a.action, a.campaign_name),
+  },
+  {
+    name: 'get_campaign_details',
+    description: 'Get a campaign\'s FULL configuration (dialing mode, ratios, recording, wrap-up, timeouts, etc.). Works for outbound, inbound, and autodial campaigns. Use before modify_campaign to see current values.',
+    inputSchema: {
+      type: 'object',
+      properties: { campaign_name: { type: 'string', description: 'Exact campaign name' } },
+      required: ['campaign_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getCampaignDetails(a.campaign_name),
+  },
+  {
+    name: 'create_campaign',
+    description: 'Create a new Five9 campaign. type outbound or inbound; mode BASIC (default) or ADVANCED (requires profile_name from list_campaign_profiles). Outbound extras: dialing_mode (PREDICTIVE/PROGRESSIVE/PREVIEW/POWER), auto_record. Inbound extras: max_lines. The campaign is created NOT_RUNNING — attach lists/skills/DNIS, then start it with control_campaign.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', enum: ['outbound', 'inbound'] },
+        name: { type: 'string' },
+        mode: { type: 'string', enum: ['BASIC', 'ADVANCED'] },
+        profile_name: { type: 'string', description: 'Campaign profile (required for ADVANCED mode)' },
+        description: { type: 'string' },
+        dialing_mode: { type: 'string', enum: ['PREDICTIVE', 'PROGRESSIVE', 'PREVIEW', 'POWER'], description: 'Outbound only' },
+        auto_record: { type: 'boolean' },
+        max_lines: { type: 'number', description: 'Inbound only: max concurrent lines (default 10)' },
+        ivr_script: { type: 'string', description: 'Inbound only (required): IVR script that answers calls — see list_ivr_scripts' },
+        training_mode: { type: 'boolean' },
+      },
+      required: ['type', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.createCampaign(a.type, {
+      name: a.name, mode: a.mode, profileName: a.profile_name, description: a.description,
+      dialingMode: a.dialing_mode, autoRecord: a.auto_record, maxNumOfLines: a.max_lines,
+      ivrScript: a.ivr_script, trainingMode: a.training_mode,
+    }),
+  },
+  {
+    name: 'modify_campaign',
+    description: 'Edit an existing campaign\'s configuration. Fetches the full campaign, merges your changes, and writes it back — so you only pass the fields you want to change (field names as returned by get_campaign_details, e.g. {"description": "...", "dialingMode": "PREVIEW", "autoRecord": true, "profileName": "..."}).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        campaign_name: { type: 'string', description: 'Exact campaign name' },
+        changes: { type: 'object', description: 'Field → new value, using get_campaign_details field names', additionalProperties: true },
+      },
+      required: ['campaign_name', 'changes'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.modifyCampaign(a.campaign_name, a.changes),
+  },
+  {
+    name: 'rename_campaign',
+    description: 'Rename a Five9 campaign.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        campaign_name: { type: 'string' },
+        new_name: { type: 'string' },
+      },
+      required: ['campaign_name', 'new_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.renameCampaign(a.campaign_name, a.new_name),
+  },
+  {
+    name: 'delete_campaign',
+    description: 'Permanently delete a Five9 campaign. Irreversible — confirm with the user first.',
+    inputSchema: {
+      type: 'object',
+      properties: { campaign_name: { type: 'string', description: 'Exact campaign name' } },
+      required: ['campaign_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.deleteCampaign(a.campaign_name),
+  },
+  {
+    name: 'manage_campaign_skills',
+    description: 'Add or remove routing skills on a campaign (controls which agents get its calls).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'remove'] },
+        campaign_name: { type: 'string' },
+        skills: { type: 'array', items: { type: 'string' }, description: 'Skill names' },
+      },
+      required: ['action', 'campaign_name', 'skills'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageCampaignSkills(a.action, a.campaign_name, a.skills),
+  },
+  {
+    name: 'manage_campaign_dnis',
+    description: 'Attach or detach DNIS (inbound numbers) on an inbound campaign. Use list_dnis to see available numbers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'remove'] },
+        campaign_name: { type: 'string' },
+        dnis: { type: 'array', items: { type: 'string' }, description: 'DNIS numbers' },
+      },
+      required: ['action', 'campaign_name', 'dnis'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageCampaignDnis(a.action, a.campaign_name, a.dnis),
+  },
+  {
+    name: 'manage_campaign_dispositions',
+    description: 'Add or remove dispositions available to agents on a campaign.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'remove'] },
+        campaign_name: { type: 'string' },
+        dispositions: { type: 'array', items: { type: 'string' }, description: 'Disposition names' },
+      },
+      required: ['action', 'campaign_name', 'dispositions'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageCampaignDispositions(a.action, a.campaign_name, a.dispositions),
+  },
+  {
+    name: 'list_campaign_profiles',
+    description: 'List campaign profiles (ANI, dialing timeout, attempts, call priority). ADVANCED campaigns require one. Optional regex pattern filters by name.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on profile name (default ".*")' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getCampaignProfiles(a.pattern || '.*'),
+  },
+  {
+    name: 'manage_campaign_profile',
+    description: 'Create, modify, or delete a campaign profile. For create: fields like {"name": "...", "description": "...", "ANI": "5551234567", "numberOfAttempts": 3, "dialingTimeout": 30}. For modify: pass name plus only the fields to change.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'modify', 'delete'] },
+        name: { type: 'string', description: 'Profile name' },
+        fields: { type: 'object', description: 'Profile fields (create/modify)', additionalProperties: true },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => {
+      if (a.action === 'create') return f9.createCampaignProfile({ name: a.name, ...(a.fields || {}) });
+      if (a.action === 'modify') return f9.modifyCampaignProfile(a.name, a.fields || {});
+      return f9.deleteCampaignProfile(a.name);
+    },
+  },
+  {
+    name: 'get_skill_details',
+    description: 'Get skills with their assigned users. Optional regex pattern filters by skill name.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on skill name (default ".*")' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getSkillDetails(a.pattern || '.*'),
+  },
+  {
+    name: 'manage_skill',
+    description: 'Create, modify, or delete a routing skill. Create: {"name": "..."} plus optional description, routeVoiceMails. Modify: pass name and only the fields to change.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'modify', 'delete'] },
+        name: { type: 'string', description: 'Skill name' },
+        fields: { type: 'object', description: 'Skill fields (create/modify): description, messageOfTheDay, routeVoiceMails', additionalProperties: true },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => {
+      if (a.action === 'create') return f9.createSkill({ name: a.name, ...(a.fields || {}) });
+      if (a.action === 'modify') return f9.modifySkill(a.name, a.fields || {});
+      return f9.deleteSkill(a.name);
+    },
+  },
+  {
+    name: 'manage_user_skills',
+    description: 'Assign a skill to a user (add), change their level (set_level), or unassign it (remove). Level 1 is highest priority.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'set_level', 'remove'] },
+        user_name: { type: 'string' },
+        skill_name: { type: 'string' },
+        level: { type: 'number', description: 'Skill level (default 1)' },
+      },
+      required: ['action', 'user_name', 'skill_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageUserSkill(a.action, a.user_name, a.skill_name, a.level),
+  },
+  {
+    name: 'get_user_details',
+    description: 'Get one user\'s full record: general info, roles, skills, and agent groups.',
+    inputSchema: {
+      type: 'object',
+      properties: { user_name: { type: 'string', description: 'Exact Five9 username' } },
+      required: ['user_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getUserDetails(a.user_name),
+  },
+  {
+    name: 'create_user',
+    description: 'Create a Five9 user. Required: user_name, password, first_name, last_name, email. roles defaults to ["agent"]; also accepts admin, supervisor, reporting. Optional: extension, user_profile_name, skills (names, assigned at level 1), agent_groups. New users must change their password on first login by default.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_name: { type: 'string' },
+        password: { type: 'string' },
+        first_name: { type: 'string' },
+        last_name: { type: 'string' },
+        email: { type: 'string' },
+        roles: { type: 'array', items: { type: 'string', enum: ['agent', 'admin', 'supervisor', 'reporting'] } },
+        extension: { type: 'string' },
+        user_profile_name: { type: 'string' },
+        skills: { type: 'array', items: { type: 'string' } },
+        agent_groups: { type: 'array', items: { type: 'string' } },
+        active: { type: 'boolean' },
+      },
+      required: ['user_name', 'password', 'first_name', 'last_name', 'email'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.createUser({
+      userName: a.user_name, password: a.password, firstName: a.first_name, lastName: a.last_name,
+      email: a.email, roles: a.roles, extension: a.extension, userProfileName: a.user_profile_name,
+      skills: a.skills, agentGroups: a.agent_groups, active: a.active,
+    }),
+  },
+  {
+    name: 'modify_user',
+    description: 'Edit a user\'s general info. Pass only fields to change, using Five9 field names from list_users (e.g. {"EMail": "...", "extension": "1234", "active": false, "firstName": "..."}).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_name: { type: 'string' },
+        changes: { type: 'object', description: 'Field → new value', additionalProperties: true },
+      },
+      required: ['user_name', 'changes'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.modifyUser(a.user_name, a.changes),
+  },
+  {
+    name: 'delete_user',
+    description: 'Permanently delete a Five9 user. Irreversible — confirm with the user first.',
+    inputSchema: {
+      type: 'object',
+      properties: { user_name: { type: 'string' } },
+      required: ['user_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.deleteUser(a.user_name),
+  },
+  {
+    name: 'list_user_profiles',
+    description: 'List user profiles (role/permission templates users can be assigned to). Optional regex pattern.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on profile name (default ".*")' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getUserProfiles(a.pattern || '.*'),
+  },
+  {
+    name: 'manage_disposition',
+    description: 'Create, modify, rename, or delete a call disposition. Create needs fields.name and fields.type (e.g. FinalDisp, FinalApplyToCampaigns, AddActiveNumber, DoNotDial, RedialNumber). RedialNumber dispositions take typeParameters: {"allowChangeTimer": false, "attempts": 3, "timer": {"days": 0, "hours": 1, "minutes": 0, "seconds": 0}, "useTimer": true}. Modify merges your fields into the existing disposition.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'modify', 'rename', 'delete'] },
+        name: { type: 'string', description: 'Disposition name' },
+        new_name: { type: 'string', description: 'For rename' },
+        fields: { type: 'object', description: 'Disposition fields (create/modify)', additionalProperties: true },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => {
+      if (a.action === 'create') return f9.createDisposition({ name: a.name, ...(a.fields || {}) });
+      if (a.action === 'modify') return f9.modifyDisposition(a.name, a.fields || {});
+      if (a.action === 'rename') return f9.renameDisposition(a.name, a.new_name);
+      return f9.deleteDisposition(a.name);
+    },
+  },
+  {
+    name: 'manage_contact_field',
+    description: 'Create, modify, or delete a CRM contact field. Create: name + type (STRING, NUMBER, DATE, PHONE, EMAIL, BOOLEAN, etc.), optional displayAs (Short/Long/Invisible). Modify: name + the fields to change (e.g. display_as, or changes: {"displayAs": "Invisible"}) — read-modify-write, so unspecified fields are preserved. System fields cannot be modified.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'modify', 'delete'] },
+        name: { type: 'string' },
+        type: { type: 'string', enum: ['STRING', 'NUMBER', 'DATE', 'TIME', 'DATE_TIME', 'CURRENCY', 'BOOLEAN', 'PERCENT', 'EMAIL', 'URL', 'PHONE', 'TIME_PERIOD'] },
+        display_as: { type: 'string', enum: ['Short', 'Long', 'Invisible'] },
+        changes: { type: 'object', description: 'For modify: field → new value using contactField field names (displayAs, type, mapTo)', additionalProperties: true },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => {
+      if (a.action === 'create') return f9.createContactField({ name: a.name, type: a.type, displayAs: a.display_as });
+      if (a.action === 'modify') return f9.modifyContactField(a.name, a.changes || { ...(a.display_as ? { displayAs: a.display_as } : {}), ...(a.type ? { type: a.type } : {}) });
+      return f9.deleteContactField(a.name);
+    },
+  },
+  {
+    name: 'delete_contact',
+    description: 'Delete a CRM contact matching the criteria exactly, e.g. {"number1": "5551234567"}. Safety: only deletes when exactly one contact matches. Irreversible — confirm with the user first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        criteria: { type: 'object', description: 'Field → value identifying one contact', additionalProperties: { type: 'string' } },
+      },
+      required: ['criteria'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.deleteContact(a.criteria),
+  },
+  {
+    name: 'list_prompts',
+    description: 'List all voice prompts on the domain (name, type, languages).',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    handler: (f9) => f9.getPrompts(),
+  },
+  {
+    name: 'manage_tts_prompt',
+    description: 'Create, modify, or delete a text-to-speech voice prompt. Create/modify need name + text (what the prompt says); optional voice and language (default en-US).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'modify', 'delete'] },
+        name: { type: 'string', description: 'Prompt name' },
+        text: { type: 'string', description: 'What the prompt says (create/modify)' },
+        voice: { type: 'string' },
+        language: { type: 'string', description: 'e.g. en-US' },
+        description: { type: 'string' },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageTtsPrompt(a.action, a),
+  },
+  {
+    name: 'get_ivr_script',
+    description: 'Get one IVR script including its full XML definition (large). Use list_ivr_scripts to browse names first.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Exact IVR script name' } },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getIVRScript(a.name),
+  },
+  {
+    name: 'manage_agent_group',
+    description: 'Create or delete an agent group, or add/remove agents in one. add_agents/remove_agents take agents (usernames).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'delete', 'add_agents', 'remove_agents'] },
+        name: { type: 'string', description: 'Group name' },
+        agents: { type: 'array', items: { type: 'string' }, description: 'Usernames (for add/remove)' },
+        description: { type: 'string', description: 'For create' },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageAgentGroup(a.action, a.name, { agents: a.agents, description: a.description }),
+  },
+  {
+    name: 'list_call_variables',
+    description: 'List call variables (optionally filtered by regex pattern and/or group), or pass groups_only to list the variable groups instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Java-style regex on variable name' },
+        group: { type: 'string', description: 'Variable group name, e.g. Call' },
+        groups_only: { type: 'boolean', description: 'List variable groups instead of variables' },
+      },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => (a.groups_only ? f9.getCallVariableGroups() : f9.getCallVariables(a.pattern || '.*', a.group)),
+  },
+  {
+    name: 'manage_call_variable',
+    description: 'Create or delete a custom call variable. Create: name, group, optional type (STRING default), description, default_value, reporting.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'delete'] },
+        name: { type: 'string' },
+        group: { type: 'string', description: 'Variable group (required)' },
+        type: { type: 'string', enum: ['STRING', 'NUMBER', 'DATE', 'TIME', 'DATE_TIME', 'CURRENCY', 'BOOLEAN', 'PERCENT', 'EMAIL', 'URL', 'PHONE', 'TIME_PERIOD'] },
+        description: { type: 'string' },
+        default_value: { type: 'string' },
+        reporting: { type: 'boolean', description: 'Include in reports' },
+      },
+      required: ['action', 'name', 'group'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageCallVariable(a.action, { name: a.name, group: a.group, type: a.type, description: a.description, defaultValue: a.default_value, reporting: a.reporting }),
+  },
+  {
+    name: 'list_web_connectors',
+    description: 'List web connectors (URL pop / webhook-style integrations agents trigger). Optional regex pattern.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on connector name (default ".*")' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getWebConnectors(a.pattern || '.*'),
+  },
+  {
+    name: 'manage_speed_dial',
+    description: 'List, create, or delete domain speed-dial numbers. Create: code (what agents dial) + number (where it goes).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'create', 'delete'] },
+        code: { type: 'string' },
+        number: { type: 'string' },
+        description: { type: 'string' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageSpeedDial(a.action, a),
+  },
+  {
+    name: 'manage_reason_code',
+    description: 'Get, create, modify, or delete Not Ready / Logout reason codes. Five9 looks these up by exact name (no list-all API). Create/modify: name + type (NotReady | Logout), optional enabled, paidTime, shortcut.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['get', 'create', 'modify', 'delete'] },
+        name: { type: 'string', description: 'Exact reason code name' },
+        type: { type: 'string', enum: ['NotReady', 'Logout'] },
+        enabled: { type: 'boolean' },
+        paid_time: { type: 'boolean' },
+        shortcut: { type: 'number' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageReasonCode(a.action, { name: a.name, type: a.type, enabled: a.enabled, paidTime: a.paid_time, shortcut: a.shortcut }),
+  },
+  {
+    name: 'get_dialing_rules',
+    description: 'Get the domain\'s dialing rules (time/state restrictions applied to outbound dialing).',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    handler: (f9) => f9.getDialingRules(),
+  },
+  {
+    name: 'get_vcc_configuration',
+    description: 'Get domain-level VCC configuration (timezone, password policies, default settings).',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    handler: (f9) => f9.getVCCConfiguration(),
+  },
+  {
+    name: 'get_api_usage',
+    description: 'Get current Five9 API usage counters vs limits for this domain (how close you are to API rate caps).',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    handler: (f9) => f9.getApiUsage(),
+  },
+  {
+    name: 'list_dialing_lists',
+    description: 'List Five9 outbound dialing lists with their record counts. Optional regex pattern filters by list name.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on list name (default ".*" = all)' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getLists(a.pattern || '.*'),
+  },
+  {
+    name: 'add_record_to_list',
+    description: 'Add one record (lead) to a Five9 dialing list. "fields" maps Five9 contact field names to values, e.g. {"number1": "5551234567", "first_name": "Jane", "last_name": "Doe"}. number1 is the primary phone field. The import is processed asynchronously by Five9.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_name: { type: 'string', description: 'Exact dialing list name' },
+        fields: {
+          type: 'object',
+          description: 'Contact field name → value. Must include at least one field; number1 is the standard primary phone field.',
+          additionalProperties: { type: 'string' },
+        },
+        key_field: { type: 'string', description: 'Field used to match existing contacts (default: number1)' },
+      },
+      required: ['list_name', 'fields'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.addRecordToList(a.list_name, a.fields, a.key_field),
+  },
+  {
+    name: 'search_contacts',
+    description: 'Look up contact records in the Five9 CRM by exact field values, e.g. {"number1": "5551234567"} or {"last_name": "Doe"}. Returns matching records as field→value objects.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        criteria: {
+          type: 'object',
+          description: 'Contact field name → exact value to match. At least one entry required.',
+          additionalProperties: { type: 'string' },
+        },
+      },
+      required: ['criteria'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.searchContacts(a.criteria),
+  },
+  {
+    name: 'list_users',
+    description: 'List Five9 users (agents, supervisors, admins) with their general info. Optional regex pattern filters by username.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on username (default ".*" = all)' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getUsers(a.pattern || '.*'),
+  },
+  {
+    name: 'list_skills',
+    description: 'List Five9 skills (routing queues). Optional regex pattern filters by skill name.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on skill name (default ".*" = all)' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getSkills(a.pattern || '.*'),
+  },
+  {
+    name: 'list_dispositions',
+    description: 'List Five9 call dispositions and their settings. Optional regex pattern filters by disposition name.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on disposition name (default ".*" = all)' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getDispositions(a.pattern || '.*'),
+  },
+  {
+    name: 'run_report',
+    description: 'Start a Five9 report run by folder and report name (as shown in the Five9 reporting UI, e.g. folder "Call Log Reports", report "Call Log"). Returns an identifier to poll with get_report_result. Optional ISO-8601 start/end narrow the time range.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        folder_name: { type: 'string', description: 'Report folder name in Five9' },
+        report_name: { type: 'string', description: 'Report name within the folder' },
+        start: { type: 'string', description: 'ISO-8601 start time, e.g. 2026-07-21T00:00:00.000Z (requires end)' },
+        end: { type: 'string', description: 'ISO-8601 end time (requires start)' },
+      },
+      required: ['folder_name', 'report_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.runReport(a.folder_name, a.report_name, a.start, a.end),
+  },
+  {
+    name: 'get_report_result',
+    description: 'Fetch the result of a report started with run_report. Returns {ready: false} while Five9 is still generating it; when ready, returns the report as CSV text.',
+    inputSchema: {
+      type: 'object',
+      properties: { identifier: { type: 'string', description: 'Identifier returned by run_report' } },
+      required: ['identifier'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getReportResult(a.identifier),
+  },
+  {
+    name: 'list_contact_fields',
+    description: 'List the contact field definitions on this Five9 domain (name, type, restrictions). Call this to learn valid field names before add_record_to_list, update_contact, or search_contacts.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on field name (default ".*" = all)' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getContactFields(a.pattern || '.*'),
+  },
+  {
+    name: 'update_contact',
+    description: 'Update an existing Five9 CRM contact. "key" identifies the contact (e.g. {"number1": "5551234567"}), "fields" holds the new values. Does not create contacts (use add_record_to_list for that). Default update_mode UPDATE_SOLE_MATCHES only updates when exactly one contact matches the key.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'object', description: 'Field name → value identifying the contact', additionalProperties: { type: 'string' } },
+        fields: { type: 'object', description: 'Field name → new value', additionalProperties: { type: 'string' } },
+        update_mode: { type: 'string', enum: ['UPDATE_SOLE_MATCHES', 'UPDATE_FIRST', 'UPDATE_ALL'], description: 'How to handle multiple matches (default UPDATE_SOLE_MATCHES)' },
+      },
+      required: ['key', 'fields'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.updateContact(a.key, a.fields, a.update_mode || 'UPDATE_SOLE_MATCHES'),
+  },
+  {
+    name: 'delete_record_from_list',
+    description: 'Remove records matching the given field values from a Five9 dialing list, e.g. {"number1": "5551234567"}. Only removes them from the list — CRM contacts are untouched.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_name: { type: 'string', description: 'Exact dialing list name' },
+        fields: { type: 'object', description: 'Field name → value to match', additionalProperties: { type: 'string' } },
+      },
+      required: ['list_name', 'fields'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.deleteRecordFromList(a.list_name, a.fields),
+  },
+  {
+    name: 'get_import_result',
+    description: 'Check the outcome of an asynchronous Five9 import started by add_record_to_list (type "list") or a CRM update (type "crm"). Pass the importIdentifier returned by that call. Returns {ready: false} while Five9 is still processing — poll again shortly; when done, returns {ready: true} plus the import result (records inserted/updated, errors).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        identifier: { type: 'string', description: 'Import identifier (UUID) returned by the import call' },
+        type: { type: 'string', enum: ['list', 'crm'], description: 'Which import pipeline to query (default list)' },
+      },
+      required: ['identifier'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getImportResult(a.identifier, a.type || 'list'),
+  },
+  {
+    name: 'create_list',
+    description: 'Create a new (empty) Five9 dialing list.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_name: { type: 'string', description: 'Name for the new list' } },
+      required: ['list_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.createList(a.list_name),
+  },
+  {
+    name: 'delete_list',
+    description: 'Permanently delete a Five9 dialing list (its records leave the list; CRM contacts are untouched). Confirm with the user before calling.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_name: { type: 'string', description: 'Exact name of the list to delete' } },
+      required: ['list_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.deleteList(a.list_name),
+  },
+  {
+    name: 'inspect_campaign',
+    description: 'Get a campaign\'s current state plus its attached dialing lists (outbound) and DNIS numbers (inbound) in one call.',
+    inputSchema: {
+      type: 'object',
+      properties: { campaign_name: { type: 'string', description: 'Exact campaign name' } },
+      required: ['campaign_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.inspectCampaign(a.campaign_name),
+  },
+  {
+    name: 'manage_campaign_lists',
+    description: 'Attach a dialing list to an outbound campaign (action "add", with optional priority) or detach it (action "remove"). Changes what the campaign will dial — confirm with the user first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'remove'] },
+        campaign_name: { type: 'string', description: 'Exact outbound campaign name' },
+        list_name: { type: 'string', description: 'Exact dialing list name' },
+        priority: { type: 'number', description: 'Dialing priority when adding (default 1; lower = dialed first)' },
+      },
+      required: ['action', 'campaign_name', 'list_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageCampaignLists(a.action, a.campaign_name, a.list_name, a.priority),
+  },
+  {
+    name: 'manage_dnc',
+    description: 'Work with the domain Do-Not-Call list: action "check" returns which of the given numbers are on the DNC, "add" adds numbers (compliance-safe), "remove" takes them off. Removing from DNC has compliance implications — confirm with the user first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['check', 'add', 'remove'] },
+        numbers: { type: 'array', items: { type: 'string' }, description: 'Phone numbers (digits only, e.g. "5551234567")' },
+      },
+      required: ['action', 'numbers'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.dnc(a.action, a.numbers),
+  },
+  {
+    name: 'list_agent_groups',
+    description: 'List Five9 agent groups and their member usernames. Optional regex pattern filters by group name.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on group name (default ".*" = all)' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getAgentGroups(a.pattern || '.*'),
+  },
+  {
+    name: 'list_ivr_scripts',
+    description: 'List IVR scripts on the domain (metadata only — script XML bodies are omitted). Optional regex pattern filters by script name.',
+    inputSchema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Java-style regex on script name (default ".*" = all)' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getIVRScripts(a.pattern || '.*'),
+  },
+  {
+    name: 'list_dnis',
+    description: 'List the DNIS (inbound phone numbers) provisioned on this Five9 domain. Set unassigned_only to true to see only numbers not attached to any campaign.',
+    inputSchema: {
+      type: 'object',
+      properties: { unassigned_only: { type: 'boolean', description: 'Only return DNIS not assigned to a campaign' } },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getDNISList(a.unassigned_only),
+  },
+  {
+    name: 'get_realtime_stats',
+    description: 'Get real-time contact center statistics from the Five9 Statistics API. statistic_type picks the view: AgentState (who is on a call / ready / not ready right now), ACDStatus (queue depth and wait times per skill), CampaignState, InboundCampaignStatistics, OutboundCampaignStatistics, OutboundCampaignManager (list/dialer manager view), AutodialCampaignStatistics, AgentStatistics (per-agent daily performance).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        statistic_type: {
+          type: 'string',
+          enum: ['AgentState', 'ACDStatus', 'CampaignState', 'InboundCampaignStatistics', 'OutboundCampaignStatistics', 'OutboundCampaignManager', 'AutodialCampaignStatistics', 'AgentStatistics'],
+        },
+      },
+      required: ['statistic_type'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.getRealtimeStats(a.statistic_type),
+  },
+  {
+    name: 'add_records_to_list',
+    description: 'Bulk-add many records (leads) to a Five9 dialing list in one async import. records is an array of contact field→value objects (e.g. [{"number1":"5551230001","first_name":"A"},{"number1":"5551230002"}]); columns are the union of all records\' fields. number1 is the standard primary phone field and default key. Returns an importIdentifier to poll with get_import_result. Inserts real leads that may be dialed — confirm with the user first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_name: { type: 'string', description: 'Exact dialing list name' },
+        records: {
+          type: 'array',
+          description: 'Array of contact field→value objects (one per lead).',
+          items: { type: 'object', additionalProperties: { type: 'string' } },
+          minItems: 1,
+        },
+        key_field: { type: 'string', description: 'Field used to match existing contacts (default: number1)' },
+        crm_add_mode: { type: 'string', enum: ['ADD_NEW', 'DONT_ADD'], description: 'How to handle new CRM contacts (default ADD_NEW)' },
+        crm_update_mode: { type: 'string', enum: ['UPDATE_FIRST', 'UPDATE_ALL', 'UPDATE_SOLE_MATCHES'], description: 'How to update matching CRM contacts (default UPDATE_FIRST)' },
+        list_add_mode: { type: 'string', enum: ['ADD_FIRST', 'ADD_ALL', 'ADD_IF_SOLE_CRM_MATCH'], description: 'How records join the list (default ADD_FIRST)' },
+        clean_list_before_update: { type: 'boolean', description: 'Empty the list before importing (default false)' },
+      },
+      required: ['list_name', 'records'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.addRecordsToList(a.list_name, a.records, {
+      keyField: a.key_field, crmAddMode: a.crm_add_mode, crmUpdateMode: a.crm_update_mode,
+      listAddMode: a.list_add_mode, cleanListBeforeUpdate: a.clean_list_before_update,
+    }),
+  },
+  {
+    name: 'bulk_update_contacts',
+    description: 'Update many Five9 CRM contacts in one async import. records is an array of field→value objects; key_fields names the field(s) that identify which contact each row updates (e.g. ["number1"]). Every non-key field is written. Does not create contacts by default (crm_add_mode DONT_ADD). Returns an importIdentifier — poll get_import_result with type "crm".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        records: {
+          type: 'array',
+          description: 'Array of field→value objects; each must include the key field(s).',
+          items: { type: 'object', additionalProperties: { type: 'string' } },
+          minItems: 1,
+        },
+        key_fields: {
+          type: 'array',
+          description: 'Field name(s) that identify the contact to update (e.g. ["number1"]).',
+          items: { type: 'string' },
+          minItems: 1,
+        },
+        crm_add_mode: { type: 'string', enum: ['DONT_ADD', 'ADD_NEW'], description: 'Whether to insert rows with no match (default DONT_ADD)' },
+        crm_update_mode: { type: 'string', enum: ['UPDATE_FIRST', 'UPDATE_ALL', 'UPDATE_SOLE_MATCHES'], description: 'How to update matching contacts (default UPDATE_FIRST)' },
+      },
+      required: ['records', 'key_fields'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.updateContactsBulk(a.records, a.key_fields, {
+      crmAddMode: a.crm_add_mode, crmUpdateMode: a.crm_update_mode,
+    }),
+  },
+  {
+    name: 'set_agent_permissions',
+    description: 'Turn individual AGENT permissions on or off for a user (ReceiveTransfer, CreateChatSessions, CanTransferChatsToAgents, CanTransferChatsToSkills, CanRejectCalls, CanWrapCall, SendMessages, ManageAvailabilityBySkill, ...). Reads the current permission set and MERGES your changes, so permissions you do not name are left alone. Run get_user_details first to see the exact permission names and current values. Note: users built from the blank Create User form start with almost every agent permission false.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_name: { type: 'string', description: 'Exact Five9 username' },
+        enable: { type: 'array', items: { type: 'string' }, description: 'Permission types to set true' },
+        disable: { type: 'array', items: { type: 'string' }, description: 'Permission types to set false' },
+      },
+      required: ['user_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.setAgentPermissions(a.user_name, { enable: a.enable, disable: a.disable }),
+  },
+  {
+    name: 'set_user_roles',
+    description: 'Grant and/or revoke Five9 roles on a user. add enables roles (agent, admin, supervisor, reporting, crmManager); remove revokes them. The supervisor role requires at least one viewable tab — by default it grants Agents/Campaigns/CallMonitoring, or pass permissions.supervisor with an explicit list of tabs (Users, Agents, CallMonitoring, Stations, Campaigns, CampaignManagement, AllSkills, BargeInMonitor, WhisperMonitor, ReviewVoiceRecordings, …). Use get_user_details to see current roles.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_name: { type: 'string', description: 'Exact Five9 username' },
+        add: { type: 'array', items: { type: 'string', enum: ['agent', 'admin', 'supervisor', 'reporting', 'crmManager'] }, description: 'Roles to enable' },
+        remove: { type: 'array', items: { type: 'string', enum: ['agent', 'admin', 'supervisor', 'reporting', 'crmManager'] }, description: 'Roles to revoke' },
+        permissions: { type: 'object', description: 'Optional per-role permission tabs, e.g. {"supervisor": ["Agents","Campaigns"]}', additionalProperties: true },
+      },
+      required: ['user_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.setUserRoles(a.user_name, { add: a.add, remove: a.remove, permissions: a.permissions }),
+  },
+  {
+    name: 'manage_web_connector',
+    description: 'Create, modify, or delete a web connector (URL pop / webhook fired by agent or call events). Create needs name + url. Modify is read-modify-write: pass only what changes. trigger: ManuallyStarted [create default], ManuallyStartedAllowDuringPreviews, OnCallAccepted, OnCallDisconnected, OnCallDispositioned, OnPreview, OnContactSelection. For OnCallDispositioned connectors, trigger_dispositions REPLACES the list of dispositions that fire it, while add_trigger_dispositions / remove_trigger_dispositions edit it incrementally (all by exact disposition name). post_variables / variables / post_constants are the URL or POST-body fields: either [{key, value}] or a {key: value} object where value is a Five9 variable name (e.g. "Agent.user_name", "Call.ANI", "Customer.number1") or a constant; each list REPLACES the existing list when given. Set post_method true for a POST body, execute_in_browser false for a silent server-side call.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'modify', 'delete'] },
+        name: { type: 'string', description: 'Connector name' },
+        url: { type: 'string', description: 'Target URL' },
+        description: { type: 'string' },
+        trigger: { type: 'string', description: 'ManuallyStarted, ManuallyStartedAllowDuringPreviews, OnCallAccepted, OnCallDisconnected, OnCallDispositioned, OnPreview, OnContactSelection (other Five9 connectorTrigger values pass through unchanged)' },
+        trigger_dispositions: { type: 'array', items: { type: 'string' }, description: 'OnCallDispositioned only: full list of disposition names that fire the connector (replaces the current list)' },
+        add_trigger_dispositions: { type: 'array', items: { type: 'string' }, description: 'modify: disposition names to add to the trigger list' },
+        remove_trigger_dispositions: { type: 'array', items: { type: 'string' }, description: 'modify: disposition names to remove from the trigger list' },
+        post_variables: { description: 'POST-body fields: [{key, value}] or {key: value}; value is a Five9 variable name or constant', anyOf: [{ type: 'array', items: { type: 'object', additionalProperties: true } }, { type: 'object', additionalProperties: true }] },
+        variables: { description: 'URL query fields: [{key, value}] or {key: value}', anyOf: [{ type: 'array', items: { type: 'object', additionalProperties: true } }, { type: 'object', additionalProperties: true }] },
+        post_constants: { description: 'Constant POST-body fields: [{key, value}] or {key: value}', anyOf: [{ type: 'array', items: { type: 'object', additionalProperties: true } }, { type: 'object', additionalProperties: true }] },
+        agent_application: { type: 'string', enum: ['EmbeddedBrowser', 'ExternalBrowser'] },
+        post_method: { type: 'boolean' },
+        execute_in_browser: { type: 'boolean', description: 'false = fire silently from the Five9 server (no agent browser window)' },
+        add_worksheet: { type: 'boolean' },
+        start_page_text: { type: 'string' },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.manageWebConnector(a.action, {
+      name: a.name, url: a.url, description: a.description, trigger: a.trigger,
+      triggerDispositions: jsonish(a.trigger_dispositions), addTriggerDispositions: jsonish(a.add_trigger_dispositions), removeTriggerDispositions: jsonish(a.remove_trigger_dispositions),
+      postVariables: jsonish(a.post_variables), variables: jsonish(a.variables), postConstants: jsonish(a.post_constants),
+      agentApplication: a.agent_application, postMethod: a.post_method, executeInBrowser: a.execute_in_browser,
+      addWorksheet: a.add_worksheet, startPageText: a.start_page_text,
+    }),
+  },
+  {
+    name: 'modify_vcc_configuration',
+    description: 'Change domain-wide VCC settings (classic admin Actions -> Configure). Read-modify-write: pass only the settings to change, nested like get_vcc_configuration returns them. Common: {"miscOptions": {"defaultCampaign": "<campaign>", "maySelectCampaign": false}} sets the default campaign for manual calls and forces agents to always use it; {"timeZoneAssignment": "POSTCODE_THEN_PHONE_NUMBER"} picks how a contact\'s time zone is detected (PHONE_NUMBER, POSTCODE_THEN_PHONE_NUMBER, STATE_THEN_PHONE_NUMBER); {"campaignsSettings": {"priorityEnabled": true}} enables campaign priority; passwordPolicies, agentProductivity, extensionSettings and emailProperties are also editable. Run get_vcc_configuration first and confirm with the user — this affects every agent on the domain.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        changes: { type: 'object', description: 'Nested settings to change (same shape as get_vcc_configuration)', additionalProperties: true },
+      },
+      required: ['changes'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.modifyVCCConfiguration(jsonish(a.changes)),
+  },
+  {
+    name: 'manage_campaign_profile_filter',
+    description: 'Read or edit a campaign profile\'s CRM record-selection filter and dialing order. action "get" returns the current filter. "set_criteria" adds/removes filter conditions and sets grouping: add_criteria is an array of {compareOperator, leftValue, rightValue} (operators: Contains, Equals, NotEqual, Greater, Less, IsNull, StartsWith, …); grouping is {expression, type} where type is All, Any, or Custom (Custom uses a numbered boolean expression like "1 AND (2 OR 3)"). "set_order" manages order-by fields: add_order_by is an array of {fieldName, descending, rank}; remove_order_by is a list of field names.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['get', 'set_criteria', 'set_order'] },
+        profile_name: { type: 'string', description: 'Exact campaign profile name' },
+        grouping: { type: 'object', description: '{expression, type} (set_criteria)', additionalProperties: true },
+        add_criteria: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '{compareOperator, leftValue, rightValue} conditions to add' },
+        remove_criteria: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Conditions to remove' },
+        add_order_by: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '{fieldName, descending, rank} order-by fields to add' },
+        remove_order_by: { type: 'array', items: { type: 'string' }, description: 'Order-by field names to remove' },
+      },
+      required: ['action', 'profile_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => {
+      if (a.action === 'get') return f9.getCampaignProfileFilter(a.profile_name);
+      if (a.action === 'set_criteria') return f9.modifyCampaignProfileCrmCriteria(a.profile_name, { grouping: a.grouping, addCriteria: a.add_criteria, removeCriteria: a.remove_criteria });
+      return f9.modifyCampaignProfileFilterOrder(a.profile_name, { addOrderByField: a.add_order_by, removeOrderByField: a.remove_order_by });
+    },
+  },
+  {
+    name: 'manage_ivr_script',
+    description: 'Create, modify, or delete an IVR script. Create makes an empty script by name (optionally pushing an xml_definition); modify replaces the script body with xml_definition (the full IVR XML, as returned by get_ivr_script); delete removes it. Editing IVR XML is advanced — fetch the current definition with get_ivr_script first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'modify', 'delete'] },
+        name: { type: 'string', description: 'IVR script name' },
+        xml_definition: { type: 'string', description: 'Full IVR script XML (create optional, modify required)' },
+        description: { type: 'string' },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => {
+      if (a.action === 'create') return f9.createIVRScript(a.name, a.xml_definition, a.description);
+      if (a.action === 'modify') return f9.modifyIVRScript(a.name, a.xml_definition, a.description);
+      return f9.deleteIVRScript(a.name);
+    },
+  },
+  {
+    name: 'manage_wav_prompt',
+    description: 'Create, modify, or delete a pre-recorded WAV voice prompt. Create/modify need name + wav_base64 (the base64-encoded WAV file; Five9 requires G.711 u-law, 8kHz, mono), optional language (default en-US) and description. Use manage_tts_prompt instead for text-to-speech prompts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'modify', 'delete'] },
+        name: { type: 'string', description: 'Prompt name' },
+        wav_base64: { type: 'string', description: 'Base64-encoded WAV (G.711 u-law, 8kHz, mono)' },
+        language: { type: 'string', description: 'e.g. en-US' },
+        description: { type: 'string' },
+      },
+      required: ['action', 'name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.managePromptWav(a.action, { name: a.name, wavBase64: a.wav_base64, description: a.description, language: a.language }),
+  },
+
+  // ---- New Platform REST APIs (OAuth 2.0) — see five9rest.js ----
+  {
+    name: 'rest_check_connection',
+    description: 'Verify the Worker can obtain an OAuth 2.0 bearer token from the Five9 New Platform APIs. Confirms API Access Control is enabled and the Consumer Key/Secret are valid, and lists which named credentials are configured. Optional credential selects which one to test (default "default"; e.g. "data-tables"). Separate from check_connection, which tests the SOAP username/password.',
+    inputSchema: {
+      type: 'object',
+      properties: { credential: { type: 'string', description: 'Named credential to test (default "default"; e.g. "data-tables")' } },
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => r.checkConnection(a.credential || 'default'),
+  },
+  {
+    name: 'rest_call',
+    description: 'Make an authenticated call to any Five9 New Platform REST API endpoint (OAuth bearer token handled automatically, with rate-limit/backoff and ETag/If-Match concurrency support). Use this to explore endpoints before typed tools exist. path is relative to the base URL, e.g. "/interactions/v1/domains/{domainId}/dispositions" ({domainId} is substituted from config). credential picks which API-family credential to use (default "default"; e.g. "data-tables"). base_url overrides the host for services on a different base. For writes, pass if_match with the ETag from a prior read.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], description: 'HTTP method (default GET)' },
+        path: { type: 'string', description: 'Endpoint path relative to the base URL, e.g. "/interactions/v1/domains/{domainId}/dispositions". {domainId} is substituted automatically.' },
+        query: { type: 'object', description: 'Query-string parameters', additionalProperties: { type: 'string' } },
+        body: { type: 'object', description: 'JSON request body (for POST/PUT/PATCH)', additionalProperties: true },
+        if_match: { type: 'string', description: 'ETag value for optimistic-concurrency writes (sent as If-Match)' },
+        credential: { type: 'string', description: 'Named credential / API family to use (default "default"; e.g. "data-tables")' },
+        base_url: { type: 'string', description: 'Override the host base URL (for services hosted on a different base than the default)' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => r.request(a.method || 'GET', a.path, { query: a.query, body: a.body, ifMatch: a.if_match, credential: a.credential || 'default', baseUrl: a.base_url }),
+  },
+  {
+    name: 'manage_circle',
+    description: 'Manage Five9 Circles via the OAuth New Platform API — there is NO SOAP equivalent, so this is the way to work with circles. action: "list" (paginated), "get" (by circle_id), "create" (name + optional fields), "delete" (by circle_id). Requires an OAuth API Access Control credential (Consumer Key/Secret) — run rest_check_connection first. This is NOT the SOAP username/password used by the other tools.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'get', 'create', 'delete'] },
+        circle_id: { type: 'string', description: 'Circle id (for get/delete)' },
+        name: { type: 'string', description: 'Circle name (for create)' },
+        fields: { type: 'object', description: 'Additional circle fields for create (e.g. useTags)', additionalProperties: true },
+        cursor: { type: 'string', description: 'Pagination cursor from a prior list (nextCursor)' },
+        limit: { type: 'number', description: 'Page size (default 100)' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => {
+      if (a.action === 'list') return r.listCircles({ cursor: a.cursor, limit: a.limit });
+      if (a.action === 'get') return r.getCircle(a.circle_id);
+      if (a.action === 'create') return r.createCircle({ name: a.name, ...(a.fields || {}) });
+      return r.deleteCircle(a.circle_id);
+    },
+  },
+  {
+    name: 'list_phone_numbers',
+    description: 'List the domain phone numbers in COMPACT form: number, area code, city/state, which campaign it is assigned to, and whether voice / SMS / MMS are enabled (plus SMS direction, provider status and 10DLC campaign registry id). Use this instead of rest_call on /numbers/v1 - the raw records are ~120 lines each. Filters: sms_enabled, unassigned, area_code, search (digits anywhere in the number). A number can be assigned to only ONE campaign and carries both voice and SMS, so moving it moves both channels. Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sms_enabled: { type: 'boolean', description: 'Only SMS-enabled numbers (false = only non-SMS)' },
+        unassigned: { type: 'boolean', description: 'true = only numbers with no campaign; false = only assigned' },
+        area_code: { type: 'string', description: 'Filter by area code, e.g. "813"' },
+        search: { type: 'string', description: 'Match these digits anywhere in the number' },
+        cursor: { type: 'string', description: 'Pagination cursor (nextCursor from a prior call)' },
+        limit: { type: 'number', description: 'Page size (default 100)' },
+      },
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => r.listPhoneNumbers(a),
+  },
+  {
+    name: 'get_campaign_digital',
+    description: 'Read a campaign\'s DIGITAL settings - maxNumTextInteractions (0 means inbound SMS cannot land on it at all), voice lines, VIVR sessions, timezone, skills, DNIS and default script id. These fields are missing from SOAP get_campaign_details AND from the REST campaign LIST; only a GET by id returns them. Takes campaign_id (from list_campaigns / rest_call) or campaign_name. Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        campaign_id: { type: 'string', description: 'Campaign id, e.g. 300000000000038' },
+        campaign_name: { type: 'string', description: 'Exact campaign name (resolved to an id first)' },
+      },
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: async (r, a) => {
+      let id = a.campaign_id;
+      if (!id) {
+        if (!a.campaign_name) throw new Error('Pass campaign_id or campaign_name.');
+        const page = await r.listPaged('/campaigns/v1/domains/{domainId}/campaigns', { limit: 200 });
+        const hit = (page.items || []).find((c) => c.name === a.campaign_name);
+        if (!hit) throw new Error(`Campaign "${a.campaign_name}" not found.`);
+        id = hit.campaignId;
+      }
+      return r.getCampaignDigital(id);
+    },
+  },
+  {
+    name: 'list_np_prompts',
+    description: 'List voice prompts via the OAuth New Platform prompts API (paginated; returns richer objects than the SOAP list_prompts). Requires an OAuth API Access Control credential — see rest_check_connection. Pass cursor (from a prior nextCursor) to page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cursor: { type: 'string', description: 'Pagination cursor (nextCursor from a prior call)' },
+        limit: { type: 'number', description: 'Page size (default 100)' },
+      },
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => r.listNpPrompts({ cursor: a.cursor, limit: a.limit }),
+  },
+  {
+    name: 'list_interaction_dispositions',
+    description: 'List call dispositions via the OAuth New Platform interactions API (paginated; richer fields than the SOAP list_dispositions). Pass disposition_id to fetch a single disposition (with its notification settings). Read-only. Requires an OAuth API Access Control credential — see rest_check_connection.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        disposition_id: { type: 'string', description: 'Fetch one disposition by id instead of listing' },
+        cursor: { type: 'string', description: 'Pagination cursor (nextCursor from a prior call)' },
+        limit: { type: 'number', description: 'Page size (default 100)' },
+      },
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => (a.disposition_id ? r.getDisposition(a.disposition_id) : r.listDispositions({ cursor: a.cursor, limit: a.limit })),
+  },
+  {
+    name: 'get_domain_info',
+    description: 'Get New Platform domain metadata (domainId, name, tenant, and the domain\'s service endpoints) via the OAuth API. Requires an OAuth API Access Control credential — see rest_check_connection.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    rest: true,
+    handler: (r) => r.getDomainInfo(),
+  },
+  {
+    name: 'list_data_tables',
+    description: 'List Five9 Data Tables (structured lookup tables used in routing/IVR logic) via the OAuth New Platform API — no SOAP equivalent. Returns each table\'s id, name, description, and row count. Uses a SEPARATE "data-tables" credential (FIVE9_DT_CONSUMER_KEY/SECRET) in the "Data Tables access" API family — verify with rest_check_connection credential "data-tables". Paginated.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cursor: { type: 'string', description: 'Pagination cursor (nextCursor from a prior call)' },
+        limit: { type: 'number', description: 'Page size (default 100)' },
+      },
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => r.listDataTables({ cursor: a.cursor, limit: a.limit }),
+  },
+  {
+    name: 'get_data_table_rows',
+    description: 'Get the rows of a Five9 Data Table by table_id (paginated) via the OAuth New Platform API. Get table_id from list_data_tables. Read-only. Uses the "data-tables" credential.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table_id: { type: 'string', description: 'Data table id (dataTableId from list_data_tables)' },
+        cursor: { type: 'string', description: 'Pagination cursor (nextCursor from a prior call)' },
+        limit: { type: 'number', description: 'Page size (default 100)' },
+      },
+      required: ['table_id'],
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => r.getDataTableRows(a.table_id, { cursor: a.cursor, limit: a.limit }),
+  },
+
+  // ---- IVR builder: compose whole call flows from a JSON spec ----
+  //
+  // The flow spec (documented in ivr.js and in the validate/build tool
+  // descriptions) is deliberately constrained: the model designs the flow,
+  // deterministic code guarantees the XML. Recommended workflow:
+  //   1. validate_ivr_flow -> fix anything it flags
+  //   2. render_ivr_flow -> SHOW the user the mermaid diagram, get approval
+  //   3. generate_prompt_audio for each AI-voiced prompt (optional)
+  //   4. build_ivr_script (dry_run first if you want to inspect the XML)
+  {
+    name: 'validate_ivr_flow',
+    description: 'Validate an IVR flow spec BEFORE building: graph checks (entry, wiring, digits, reachability) plus, by default, domain checks that every referenced skill and prompt exists. Flow spec: { entry, nodes: { key: node } } where node types are ' + IVR_NODE_TYPES.join(', ') + '. play: {prompt, next}. menu: {prompt, options: [{digit, label, next}], max_attempts?}. hours: {days: ["MON".."FRI"], open: "08:00", close: "17:00", during_hours, after_hours}. skill_transfer: {skills: [...], next (queue-timeout fallback), max_queue_seconds?}. voicemail: {skill}. hangup: {disposition? (system dispositions only), overwrite_disposition?}. Routing/data nodes: lookup_contact: {field: "number1", variable?: "Call.ANI", lookup_fields?, next} loads the matching CRM contact into Contact.* variables; if_else: {conditions: [{variable: "Contact.last_agent", op: EQUALS|NOT_EQUALS|CONTAINS|REGEXP|MORE_THAN|LESS_THAN, value | value_variable}], match?: ALL|ANY, then, else}; agent_transfer: {agent_variable: "Contact.last_agent" (holds the agent USERNAME), leave_voicemail?: true, max_queue_seconds?, max_ring_seconds?, next}; third_party_transfer: {number: "4692505198" | number_variable, ringing_timeout?, max_seconds?, next}. play/menu take interruptible?: true; menu takes no_match?: "<node>" (default replays the menu). Prompts are {tts: "text"} (robot voice) or {prompt_name: "X"} (domain prompt, e.g. AI voice from generate_prompt_audio). Last-agent routing pattern: menu -> lookup_contact(number1 = Call.ANI) -> if_else(Contact.last_agent REGEXP ".+") -> then agent_transfer(Contact.last_agent) / else third_party_transfer(overflow number).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow: { type: 'object', description: 'The IVR flow spec' },
+        check_domain: { type: 'boolean', description: 'Also verify referenced skills/prompts exist on the domain (default true)' },
+      },
+      required: ['flow'],
+      additionalProperties: false,
+    },
+    handler: async (f9, a) => {
+      const result = validateFlow(a.flow);
+      const refs = collectFlowRefs(a.flow);
+      const out = { ...result, references: refs };
+      if (Object.values(a.flow?.nodes || {}).some((n) => n?.type === 'hours')) {
+        out.timezone_note = 'hours nodes compare __DAY__/__TIME__ in the DOMAIN default time zone, which the SOAP API does not expose. State your assumption to the user in one line instead of spending calls trying to derive it (see the about tool for this domain\'s time zone).';
+      }
+      if (a.check_domain !== false && (refs.skills.length || refs.prompts.length)) {
+        const skills = new Set((await f9.getSkills('.*')).map((s) => String(s.name).toLowerCase()));
+        const prompts = new Set((await f9.getPrompts()).map((p) => String(p.name).toLowerCase()));
+        out.missing_skills = refs.skills.filter((s) => !skills.has(s.toLowerCase()));
+        out.missing_prompts = refs.prompts.filter((p) => !prompts.has(p.toLowerCase()));
+        if (out.missing_skills.length || out.missing_prompts.length) {
+          out.ok = false;
+          out.note = 'Create missing skills with manage_skill and missing prompts with generate_prompt_audio (or switch those prompts to {tts}).';
+        }
+      }
+      return out;
+    },
+  },
+  {
+    name: 'render_ivr_flow',
+    description: 'Render an IVR call flow as a Mermaid flowchart. Pass either flow (a flow spec, to preview BEFORE building) or script_name (an existing IVR script on the domain). ALWAYS show the returned mermaid to the user in a ```mermaid code fence so they can see the flow before you deploy it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow: { type: 'object', description: 'Flow spec to render (see validate_ivr_flow)' },
+        script_name: { type: 'string', description: 'Existing IVR script name to render instead' },
+      },
+      additionalProperties: false,
+    },
+    handler: async (f9, a) => {
+      if (a.script_name) {
+        const script = await f9.getIVRScript(a.script_name);
+        return { script: a.script_name, mermaid: scriptXmlToMermaid(script.xmlDefinition) };
+      }
+      if (!a.flow) throw new Error('Pass flow or script_name.');
+      const check = validateFlow(a.flow);
+      if (!check.ok) return { ok: false, errors: check.errors, note: 'Fix the flow before rendering.' };
+      return { mermaid: flowToMermaid(a.flow), warnings: check.warnings };
+    },
+  },
+  {
+    name: 'build_ivr_script',
+    description: 'Build a COMPLETE Five9 IVR script from a flow spec (see validate_ivr_flow for the format) and create it on the domain. Validates the graph, resolves skill/prompt names to domain ids, and emits designer-shaped XML. Set dry_run true to get the XML back without touching the domain; set overwrite true to replace an existing script of the same name. After building, attach the script to an inbound campaign (create_campaign / modify_campaign).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'IVR script name' },
+        flow: { type: 'object', description: 'The IVR flow spec' },
+        description: { type: 'string', description: 'Script description shown in the Five9 admin' },
+        overwrite: { type: 'boolean', description: 'Replace the script if it already exists (default false)' },
+        dry_run: { type: 'boolean', description: 'Return the composed XML without creating anything (default false)' },
+      },
+      required: ['name', 'flow'],
+      additionalProperties: false,
+    },
+    handler: async (f9, a, cfg) => {
+      const refs = collectFlowRefs(a.flow);
+      const resolved = { skills: new Map(), prompts: new Map() };
+      if (refs.skills.length) {
+        for (const s of await f9.getSkills('.*')) resolved.skills.set(String(s.name).toLowerCase(), { id: s.id, name: s.name });
+      }
+      if (refs.prompts.length) {
+        // Names come from SOAP (authoritative for "does it exist"); ids come
+        // from the New Platform prompts API. id 0 saves but fails at runtime —
+        // see resolvePromptIds.
+        for (const p of await f9.getPrompts()) {
+          resolved.prompts.set(String(p.name).toLowerCase(), { id: 0, name: p.name });
+        }
+        let ids;
+        try {
+          ids = await resolvePromptIds(cfg, refs.prompts);
+        } catch (e) {
+          throw new Error(
+            `Could not look up prompt ids via the New Platform prompts API (${e.message}). ` +
+            'build_ivr_script needs real prompt ids: a file prompt written with id 0 saves fine but fails at ' +
+            'runtime with IVR error 1600 "Invalid prompt name". Configure the OAuth credential ' +
+            '(rest_check_connection), or use { tts } prompts, or build the script in the IVR designer.'
+          );
+        }
+        for (const [key, v] of ids) resolved.prompts.set(key, v);
+        const unresolved = refs.prompts.filter((n) => {
+          const r = resolved.prompts.get(String(n).toLowerCase());
+          return !r || !r.id || String(r.id) === '0';
+        });
+        if (unresolved.length) {
+          throw new Error(
+            `No prompt id found for: ${unresolved.join(', ')}. These exist by name but the New Platform prompts ` +
+            'API returned no id, so the script would fail at runtime with IVR error 1600 "Invalid prompt name". ' +
+            'Re-select the prompt in the IVR designer, or use { tts } instead.'
+          );
+        }
+      }
+      const { xml, warnings, moduleCount } = await composeIvrXml(a.flow, resolved);
+      const mermaid = flowToMermaid(a.flow);
+      if (a.dry_run) return { dry_run: true, moduleCount, warnings, mermaid, xml };
+      const existing = (await f9.getIVRScripts(a.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).find((s) => s.name === a.name);
+      if (existing && !a.overwrite) {
+        throw new Error(`IVR script "${a.name}" already exists. Pass overwrite: true to replace it.`);
+      }
+      const result = existing
+        ? await f9.modifyIVRScript(a.name, xml, a.description)
+        : await f9.createIVRScript(a.name, xml, a.description);
+      return { ...result, moduleCount, warnings, mermaid, note: 'Show the mermaid diagram to the user. Go-live chain: create_campaign (type inbound, ivr_script set) -> manage_campaign_dnis add (pick from list_dnis select_unassigned) -> control_campaign start.' };
+    },
+  },
+  {
+    name: 'find_calls',
+    description: 'Find recent calls and what happened to them (agent, campaign, disposition, call type, ANI/DNIS, timestamps) by running the standard "Call Log" report for a time window and filtering it. Filters match loosely: ani/dnis by trailing digits (formatting ignored), agent/campaign/disposition/call_type by case-insensitive substring, session_id/call_id exactly. Default window is the last 24 hours (hours), or pass start/end ISO timestamps. Waits for the report (usually 5-30 s); if it is still running, the response carries an identifier for get_report_result. Use this instead of run_report + get_report_result when the question is "did the call to 555-1234 get dispositioned / who took it".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        hours: { type: 'number', description: 'Look back this many hours from now (default 24, max 744)' },
+        start: { type: 'string', description: 'ISO-8601 window start (overrides hours; requires end)' },
+        end: { type: 'string', description: 'ISO-8601 window end' },
+        ani: { type: 'string', description: 'Caller/customer number (any formatting)' },
+        dnis: { type: 'string', description: 'Dialed number' },
+        agent: { type: 'string', description: 'Agent username or name fragment' },
+        campaign: { type: 'string' },
+        disposition: { type: 'string' },
+        call_type: { type: 'string', description: 'e.g. Inbound, Manual, Outbound' },
+        session_id: { type: 'string' },
+        call_id: { type: 'string' },
+        limit: { type: 'integer', description: 'Max rows to return (default 50, max 500) — the most recent are kept' },
+        columns: { type: 'array', items: { type: 'string' }, description: 'Only return these report columns' },
+        folder_name: { type: 'string', description: 'Report folder (default "Call Log Reports")' },
+        report_name: { type: 'string', description: 'Report name (default "Call Log")' },
+      },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => findCalls(f9, { hours: a.hours, start: a.start, end: a.end, ani: a.ani, dnis: a.dnis, agent: a.agent, campaign: a.campaign, disposition: a.disposition, callType: a.call_type, sessionId: a.session_id, callId: a.call_id, limit: a.limit, columns: jsonish(a.columns), folderName: a.folder_name, reportName: a.report_name }),
+  },
+  {
+    name: 'bulk_create_users',
+    description: 'Provision many Five9 users from CSV text in one go (the onboarding spreadsheet a client sends). Header columns (case-insensitive, aliases accepted): username (or email), first name, last name, email, roles (agent|admin|supervisor|reporting, separated by ; or |), skills (names, ; separated), agent groups, extension, user profile, phone, active, password (optional — a random temporary password is generated otherwise; users must change it at first login). Runs as a DRY RUN by default: validates every row, checks usernames against the domain and that every skill exists, and returns the plan. Re-run with dry_run false to create. skip_existing true skips usernames already on the domain instead of blocking. This creates real logins — restate the count and roles and get explicit confirmation before dry_run false.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        csv: { type: 'string', description: 'CSV text including the header line' },
+        dry_run: { type: 'boolean', description: 'Validate and plan only (default true)' },
+        skip_existing: { type: 'boolean', description: 'Skip usernames that already exist instead of stopping (default false)' },
+        reveal_passwords: { type: 'boolean', description: 'Echo the generated temporary passwords in the result (default false)' },
+        default_roles: { type: 'array', items: { type: 'string' }, description: 'Roles for rows without a roles column (default ["agent"])' },
+        default_skills: { type: 'array', items: { type: 'string' }, description: 'Skills for rows without a skills column' },
+        default_user_profile: { type: 'string', description: 'User profile for rows without one' },
+        default_agent_groups: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['csv'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => bulkCreateUsers(f9, a.csv, { dryRun: a.dry_run, skipExisting: a.skip_existing, revealPasswords: a.reveal_passwords,
+      defaults: { roles: jsonish(a.default_roles), skills: jsonish(a.default_skills), userProfileName: a.default_user_profile, agentGroups: jsonish(a.default_agent_groups) } }),
+  },
+  {
+    name: 'list_ivr_modules',
+    description: 'Inventory of an EXISTING IVR script: every module with its type, name, and wiring resolved to module names (menu keys and where they go, transfer numbers, prompts, agent-transfer variables, lookup fields, if/else conditions, hangup dispositions). Much smaller than get_ivr_script and the right first step before patch_ivr_script. Module names are the handles patch_ivr_script uses.',
+    inputSchema: {
+      type: 'object',
+      properties: { script_name: { type: 'string', description: 'Exact IVR script name' } },
+      required: ['script_name'],
+      additionalProperties: false,
+    },
+    handler: async (f9, a) => {
+      const script = await f9.getIVRScript(a.script_name);
+      return { script: a.script_name, ...listIvrModules(script.xmlDefinition) };
+    },
+  },
+  {
+    name: 'patch_ivr_script',
+    description: 'Make targeted edits to an EXISTING IVR script without hand-editing its XML. Each op names a module (from list_ivr_modules) and what to change; everything else in the script is left byte-for-byte as it was. Ops: set_transfer_number {module, number}; set_prompt {module, prompt_name} (play/menu main prompt, must exist on the domain); set_interruptible {module, value}; set_agent_variable {module, variable} (e.g. "Contact.last_agent"); set_menu_option {module, digit, next, label?} (retargets an existing key or adds a new one; next is a module NAME); remove_menu_option {module, digit}; set_no_match {module, next}; set_condition {module, variable, comparison, value | value_variable} (if/else; replaces its conditions; comparison: ' + IF_ELSE_OPS.join(', ') + '); set_hangup_disposition {module, disposition, overwrite?} (system dispositions only); rename_module {module, new_name}; set_lookup_field {module, field, variable?}. ALWAYS run with dry_run true first and show the user the change list; then run again with dry_run false to push. Take a copy with get_ivr_script before the first real push on a script you care about.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        script_name: { type: 'string', description: 'Exact IVR script name' },
+        ops: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Ordered list of { op, module, ... } edits' },
+        dry_run: { type: 'boolean', description: 'true = report the changes and return nothing to Five9 (default true)' },
+        return_xml: { type: 'boolean', description: 'Include the patched XML in the response (large; default false)' },
+      },
+      required: ['script_name', 'ops'],
+      additionalProperties: false,
+    },
+    handler: async (f9, a, cfg) => {
+      const script = await f9.getIVRScript(a.script_name);
+      const resolved = { prompts: new Map() };
+      const promptOps = toArray(jsonish(a.ops)).filter((o) => o?.op === 'set_prompt');
+      if (promptOps.length) {
+        // SOAP getPrompts is authoritative for *does this name exist* but carries
+        // no ids — writing its `id ?? 0` here was the same defect build_ivr_script
+        // had, and it ships a script that fails at runtime with error 1600.
+        const names = promptOps.map((o) => String(o.prompt_name ?? ''));
+        const onDomain = new Set((await f9.getPrompts()).map((p) => String(p.name).toLowerCase()));
+        const missing = names.filter((n) => n && !onDomain.has(n.toLowerCase()));
+        if (missing.length) {
+          throw new Five9Error(
+            `Prompt(s) not on the domain: ${missing.join(', ')}. `
+            + 'See list_prompts, or upload with generate_prompt_audio / manage_wav_prompt.'
+          );
+        }
+        const byName = await resolvePromptIds(cfg, names.filter(Boolean));
+        for (const [k, v] of byName) resolved.prompts.set(k, v);
+      }
+      const { xml, changes } = patchIvrXml(script.xmlDefinition, jsonish(a.ops), resolved);
+      const dryRun = a.dry_run !== false;
+      const out = { script: a.script_name, dry_run: dryRun, changes, modules_after: listIvrModules(xml).module_count };
+      if (a.return_xml) out.xml = xml;
+      if (dryRun) { out.note = 'Nothing was sent to Five9. Re-run with dry_run: false to apply these changes.'; return out; }
+      await f9.modifyIVRScript(a.script_name, xml, script.description);
+      out.applied = true;
+      out.note = 'Script updated. Open it once in the IVR designer (or place a test call) to confirm Five9 accepted the wiring.';
+      return out;
+    },
+  },
+  {
+    name: 'generate_prompt_audio',
+    description: 'Generate a voice prompt with a MODERN AI voice and upload it to Five9 as a WAV prompt (auto-converted to the required G.711 u-law 8kHz mono). Default provider is Cloudflare Workers AI (Deepgram Aura-2) built into this Worker: no external TTS account or API key needed, ~40 voices (default "luna"; try asteria, orion, athena, zeus). ElevenLabs/OpenAI are optional alternatives when their API-key secrets are set. Use instead of manage_tts_prompt when the prompt should sound human. The uploaded prompt can then be referenced from flows as {prompt_name}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Prompt name to create/update on Five9' },
+        text: { type: 'string', description: 'What the prompt says' },
+        provider: { type: 'string', enum: ['workers-ai', 'elevenlabs', 'openai'], description: 'TTS provider (default workers-ai, which needs no key)' },
+        voice: { type: 'string', description: 'Voice: Aura-2 speaker for workers-ai (default "luna"), or the provider-specific voice id for elevenlabs/openai' },
+        model: { type: 'string', description: 'TTS model override' },
+        description: { type: 'string', description: 'Prompt description in Five9' },
+        language: { type: 'string', description: 'Prompt language tag (default en-US)' },
+        overwrite: { type: 'boolean', description: 'Update the prompt if it already exists (default false)' },
+      },
+      required: ['name', 'text'],
+      additionalProperties: false,
+    },
+    handler: async (f9, a, cfg) => {
+      const provider = a.provider || (cfg?.ai ? 'workers-ai' : (cfg?.ttsKeys?.elevenlabs ? 'elevenlabs' : (cfg?.ttsKeys?.openai ? 'openai' : 'workers-ai')));
+      const apiKey = cfg?.ttsKeys?.[provider] || '';
+      const audio = await synthesizeUlawWav({ provider, apiKey, ai: cfg?.ai, text: a.text, voice: a.voice, model: a.model });
+      const existing = (await f9.getPrompts()).some((p) => p.name === a.name);
+      if (existing && !a.overwrite) {
+        throw new Error(`Prompt "${a.name}" already exists. Pass overwrite: true to replace it.`);
+      }
+      const result = await f9.managePromptWav(existing ? 'modify' : 'create', {
+        name: a.name, wavBase64: audio.wavBase64, description: a.description, language: a.language,
+      });
+      return { ...result, provider, approxSeconds: audio.approxSeconds, bytes: audio.bytes };
+    },
+  },
+];
+
+// ---- Web-UI display metadata (consumed by ui.js) ----
+//
+// Grouping + write-flag metadata lives here, next to the tools, so adding a
+// tool and giving it a UI home happen in one file. The console and landing
+// page derive their layout from this; any tool missing from TOOL_GROUPS falls
+// into an "Other" bucket, and a CI check (npm test) fails if that happens.
+
+export const TOOL_GROUPS = [
+  { name: 'Connection & context', icon: '🔌', tools: ['about', 'check_connection', 'get_api_usage', 'rest_check_connection'] },
+  { name: 'Campaigns', icon: '📞', tools: ['list_campaigns', 'inspect_campaign', 'get_campaign_details', 'create_campaign', 'modify_campaign', 'rename_campaign', 'delete_campaign', 'control_campaign', 'manage_campaign_lists', 'manage_campaign_skills', 'manage_campaign_dnis', 'manage_campaign_dispositions', 'list_campaign_profiles', 'manage_campaign_profile', 'manage_campaign_profile_filter'] },
+  { name: 'Dialing lists & leads', icon: '📋', tools: ['list_dialing_lists', 'create_list', 'delete_list', 'add_record_to_list', 'add_records_to_list', 'delete_record_from_list', 'get_import_result'] },
+  { name: 'CRM contacts', icon: '👤', tools: ['search_contacts', 'update_contact', 'bulk_update_contacts', 'delete_contact', 'list_contact_fields', 'manage_contact_field'] },
+  { name: 'Compliance', icon: '🚫', tools: ['manage_dnc', 'get_dialing_rules'] },
+  { name: 'Users & skills', icon: '🧑‍💼', tools: ['list_users', 'get_user_details', 'create_user', 'bulk_create_users', 'modify_user', 'delete_user', 'set_user_roles', 'set_agent_permissions', 'list_user_profiles', 'list_skills', 'get_skill_details', 'manage_skill', 'manage_user_skills', 'list_agent_groups', 'manage_agent_group', 'manage_reason_code'] },
+  { name: 'Domain configuration', icon: '🏢', tools: ['list_dispositions', 'manage_disposition', 'list_ivr_scripts', 'get_ivr_script', 'manage_ivr_script', 'list_prompts', 'manage_tts_prompt', 'manage_wav_prompt', 'list_dnis', 'list_call_variables', 'manage_call_variable', 'list_web_connectors', 'manage_web_connector', 'manage_speed_dial', 'get_vcc_configuration', 'modify_vcc_configuration'] },
+  { name: 'Reporting & real-time', icon: '📈', tools: ['run_report', 'get_report_result', 'find_calls', 'get_realtime_stats'] },
+  { name: 'New Platform (REST)', icon: '🆕', tools: ['rest_call', 'manage_circle', 'list_np_prompts', 'list_phone_numbers', 'get_campaign_digital', 'list_interaction_dispositions', 'get_domain_info', 'list_data_tables', 'get_data_table_rows'] },
+  { name: 'IVR builder', icon: '🧩', tools: ['validate_ivr_flow', 'render_ivr_flow', 'build_ivr_script', 'list_ivr_modules', 'patch_ivr_script', 'generate_prompt_audio'] },
+];
+
+export const WRITE_TOOLS = new Set([
+  'control_campaign', 'manage_campaign_lists', 'create_list', 'delete_list',
+  'add_record_to_list', 'add_records_to_list', 'delete_record_from_list', 'update_contact',
+  'bulk_update_contacts', 'manage_dnc', 'create_campaign', 'modify_campaign',
+  'rename_campaign', 'delete_campaign', 'manage_campaign_skills', 'manage_campaign_dnis',
+  'manage_campaign_dispositions', 'manage_campaign_profile', 'manage_campaign_profile_filter',
+  'manage_skill', 'manage_user_skills', 'set_user_roles', 'create_user', 'modify_user',
+  'delete_user', 'manage_disposition', 'manage_contact_field', 'delete_contact',
+  'manage_tts_prompt', 'manage_wav_prompt', 'manage_ivr_script', 'manage_agent_group',
+  'manage_call_variable', 'manage_web_connector', 'manage_speed_dial', 'manage_reason_code',
+  'manage_circle', 'rest_call', 'build_ivr_script', 'generate_prompt_audio', 'set_agent_permissions',
+  'modify_vcc_configuration', 'patch_ivr_script', 'bulk_create_users',
+]);
+
+export function toolDefs() {
+  return TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
+}
+
+// Resolve file-prompt NAMES to their real Five9 prompt ids.
+//
+// The SOAP getPrompts list carries no ids. Emitting a file prompt as
+// <id>0</id> + name is accepted on SAVE and survives a round-trip, but the IVR
+// RUNTIME cannot resolve it: the call dies on that module with
+//   IVR.error_code 1600 / IVR.error_desc "Invalid prompt name"
+// (observed live on a production domain, 9/11/2026 — a menu built this way failed on
+// every inbound call, while the same prompt worked in a designer-authored
+// script). Real ids come from the New Platform prompts API.
+async function resolvePromptIds(cfg, names) {
+  const wanted = new Set(names.map((n) => String(n).toLowerCase()));
+  const byName = new Map();
+  const rest = makeRest(cfg);
+  let cursor = null;
+  do {
+    const page = await rest.listNpPrompts({ cursor, limit: 100 });
+    for (const p of page.items || []) {
+      const key = String(p.name ?? '').toLowerCase();
+      if (wanted.has(key) && p.promptId != null) byName.set(key, { id: String(p.promptId), name: p.name });
+    }
+    cursor = page.nextCursor;
+  } while (cursor && byName.size < wanted.size);
+  return byName;
+}
+
+// Build a REST client that can find its own domain id. FIVE9_DOMAIN_ID is
+// optional configuration, not a prerequisite: when it is unset, the SOAP
+// getVCCConfiguration call (same domain, credentials we already hold) supplies
+// it on first use and the client caches it for the rest of the request.
+export function makeRest(cfg) {
+  return new Five9RestClient({
+    ...cfg,
+    domainIdResolver: cfg?.domainIdResolver || (async () => {
+      const conf = await new Five9Client(cfg).getVCCConfiguration();
+      return conf?.domainId ?? conf?.configuration?.domainId ?? '';
+    }),
+  });
+}
+
+export async function callTool(cfg, name, args) {
+  const tool = TOOLS.find((t) => t.name === name);
+  if (!tool) throw new Error(`Unknown tool: ${name}`);
+  if (tool.rest) return tool.handler(makeRest(cfg), args || {}, cfg);
+  const f9 = tool.five9 === false ? null : new Five9Client(cfg);
+  return tool.handler(f9, args || {}, cfg);
+}
